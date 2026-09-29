@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { ClipSegment } from '../audio/types';
 import type { DiffMembership, DiffSegment } from '../audio/compare';
+import type { ReworkMembership, ReworkDiffSegment } from '../audio/rework-compare';
 import type { ViewRange } from '../audio/view-range';
 
 /** 差异条着色：与差异表共用同一差异数组的标记 */
@@ -9,6 +10,24 @@ export const DIFF_STRIPE_COLORS: Record<DiffMembership, string> = {
   CANDIDATE_ONLY: '#52c41a',
   BOTH: '#94a3b8'
 };
+
+/**
+ * 返工对照差异条着色：与返工差异表共用同一 ReworkDiffSegment 数组。
+ * - 橙：仅原件（返工已修复）；绿：仅返工件（新引入）；灰：两边仍削波；
+ * - 蓝/紫斜纹色：落在重叠区外、不可比较，绝不用橙/绿暗示质量变化。
+ */
+export const REWORK_STRIPE_COLORS: Record<ReworkMembership, string> = {
+  BASELINE_ONLY: '#ff7a45',
+  REWORK_ONLY: '#52c41a',
+  BOTH: '#94a3b8',
+  BASELINE_UNCOMPARED: '#4d7cff',
+  REWORK_UNCOMPARED: '#b37dff'
+};
+
+/** 差异条片段：候选规则比较或返工对照二选一，二者不共用着色映射 */
+export type StripeSegment =
+  | ({ source: 'rule' } & DiffSegment)
+  | ({ source: 'rework' } & ReworkDiffSegment);
 
 interface WaveformProps {
   data: Float32Array;
@@ -20,6 +39,13 @@ interface WaveformProps {
   onSeek: (seconds: number) => void;
   /** 候选规则比较的差异片段（与差异表同一数组）；未启用比较时不传 */
   diffs?: DiffSegment[];
+  /**
+   * 差异条片段（规则比较或返工对照，与各自差异表同一数组）。
+   * 传入时优先于 diffs；diffs 仅为原单文件规则比较保留。
+   */
+  stripes?: StripeSegment[];
+  /** 差异条按哪一侧坐标着色（返工对照双波形分别取各自时间轴） */
+  stripeSide?: 'baseline' | 'rework';
 }
 
 /**
@@ -37,7 +63,9 @@ export default function Waveform({
   positionSeconds,
   viewRange,
   onSeek,
-  diffs
+  diffs,
+  stripes,
+  stripeSide
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -152,17 +180,39 @@ export default function Waveform({
       }
       ctx.stroke();
 
-      // 差异条：启用比较时按同一差异数组逐段着色（底部横带）
-      if (diffs && diffs.length > 0) {
+      // 差异条：规则比较或返工对照均按“同一差异数组”逐段着色（底部横带）
+      const stripeList: StripeSegment[] =
+        stripes ??
+        (diffs
+          ? diffs.map((d) => ({ ...d, source: 'rule' as const }))
+          : []);
+      if (stripeList.length > 0) {
         const stripHeight = 12;
         const stripTop = cssHeight - stripHeight;
-        for (const d of diffs) {
-          const s = Math.max(d.startSeconds, startSec);
-          const e = Math.min(d.endSeconds, endSec);
+        for (const d of stripeList) {
+          // 返工对照的双波形各自只画本侧坐标（对侧为 null 的片段跳过）
+          let sSec: number | null;
+          let eSec: number | null;
+          let color: string;
+          if (d.source === 'rework') {
+            const side = stripeSide ?? 'baseline';
+            const s = side === 'rework' ? d.reworkStartSeconds : d.baselineStartSeconds;
+            const e = side === 'rework' ? d.reworkEndSeconds : d.baselineEndSeconds;
+            if (s === null || e === null) continue;
+            sSec = s;
+            eSec = e;
+            color = REWORK_STRIPE_COLORS[d.membership];
+          } else {
+            sSec = d.startSeconds;
+            eSec = d.endSeconds;
+            color = DIFF_STRIPE_COLORS[d.membership];
+          }
+          const s = Math.max(sSec, startSec);
+          const e = Math.min(eSec, endSec);
           if (e <= s) continue;
           const x0 = xForTime(s);
           const x1 = Math.max(x0 + 1, xForTime(e));
-          ctx.fillStyle = DIFF_STRIPE_COLORS[d.membership];
+          ctx.fillStyle = color;
           ctx.fillRect(x0, stripTop, x1 - x0, stripHeight);
         }
       }
@@ -183,7 +233,7 @@ export default function Waveform({
     const observer = new ResizeObserver(draw);
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [data, sampleRate, segments, positionSeconds, startSec, span, duration, diffs]);
+  }, [data, sampleRate, segments, positionSeconds, startSec, span, duration, diffs, stripes, stripeSide]);
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;

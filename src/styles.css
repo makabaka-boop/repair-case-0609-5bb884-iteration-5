@@ -437,3 +437,68 @@ audio {
   color: #101725;
   background: #94a3b8;
 }
+
+/* ── 返工文件对照 ── */
+.rework-panel .rework-meta {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rework-alignment {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 6px;
+}
+
+.rework-alignment strong {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.rework-channel {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  margin-top: 14px;
+}
+
+.rework-channel:first-of-type {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.rework-wave-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.rework-wave-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.diff-badge.rework-baseline-only {
+  color: #2a1404;
+  background: #ff7a45;
+}
+
+.diff-badge.rework-rework-only {
+  color: #062206;
+  background: #52c41a;
+}
+
+.diff-badge.rework-both {
+  color: #101725;
+  background: #94a3b8;
+}
+
+.diff-badge.rework-baseline-uncompared,
+.diff-badge.rework-rework-uncompared {
+  color: #eef2ff;
+  background: #5b5bd6;
+}

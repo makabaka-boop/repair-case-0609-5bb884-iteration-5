@@ -8,6 +8,19 @@ import {
   type RuleComparison
 } from './audio/compare';
 import {
+  INVALID_ANCHOR_NOTICE,
+  alignmentErrorMessage,
+  alignByAnchor,
+  parseAnchorInput,
+  type AnchorError
+} from './audio/alignment';
+import {
+  ReworkMismatchError,
+  buildReworkComparison,
+  type ReworkComparison,
+  type ReworkDiffSegment
+} from './audio/rework-compare';
+import {
   INVALID_WINDOW_NOTICE,
   SHORT_RECORDING_NOTICE,
   fullTrackRange,
@@ -15,9 +28,10 @@ import {
   parseWindowSeconds,
   type ViewRange
 } from './audio/view-range';
-import Waveform, { DIFF_STRIPE_COLORS } from './components/Waveform';
+import Waveform, { DIFF_STRIPE_COLORS, REWORK_STRIPE_COLORS } from './components/Waveform';
 import SegmentList from './components/SegmentList';
 import DiffList from './components/DiffList';
+import ReworkDiffList from './components/ReworkDiffList';
 
 type Status = 'idle' | 'loading' | 'error' | 'done';
 
@@ -48,6 +62,19 @@ const DEFAULT_RULE_INPUTS = {
   maxMergeGap: '2'
 };
 
+/** 返工对照锚点输入默认值：起点 0s、长度 0.5s、±80 帧、声道 0 */
+const DEFAULT_ANCHOR_INPUTS = {
+  startSeconds: '0',
+  lengthSeconds: '0.5',
+  maxOffsetFrames: '80',
+  channel: '0'
+};
+
+/** 偏移展示：正数加 +，负数用真正的减号 −（非连字符） */
+function formatOffset(frames: number): string {
+  return (frames > 0 ? '+' : '') + String(frames).replace('-', '−');
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState<ErrorState | null>(null);
@@ -69,18 +96,47 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const objectUrlRef = useRef<string | null>(null);
 
+  // ── 返工文件对照 ───────────────────────────────────────────────
+  // reworkLoaded：已确认载入的返工扫描；reworkComparison：已确认的对照
+  // （差异表/双波形/试听共用同一对象，单次 setState 原子生效）。
+  // 解码/对齐是异步的：baseToken / reworkToken 单调递增，
+  // 迟到结果只在令牌仍最新时提交，不能覆盖更新的文件。
+  const [reworkStatus, setReworkStatus] = useState<Status>('idle');
+  const [reworkLoaded, setReworkLoaded] = useState<LoadedWav | null>(null);
+  const [reworkError, setReworkError] = useState<ErrorState | null>(null);
+  const [anchorInputs, setAnchorInputs] = useState(DEFAULT_ANCHOR_INPUTS);
+  const [anchorError, setAnchorError] = useState<string | null>(null);
+  const [reworkComparison, setReworkComparison] =
+    useState<ReworkComparison | null>(null);
+  const [reworkBusy, setReworkBusy] = useState(false);
+  const [reworkPosition, setReworkPosition] = useState(0);
+  const reworkAudioRef = useRef<HTMLAudioElement | null>(null);
+  const reworkObjectUrlRef = useRef<string | null>(null);
+  const baseTokenRef = useRef(0);
+  const reworkTokenRef = useRef(0);
+
   useEffect(() => {
     return () => {
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      if (reworkObjectUrlRef.current) URL.revokeObjectURL(reworkObjectUrlRef.current);
     };
   }, []);
 
   const handleFile = async (file: File | null | undefined) => {
     if (!file) return;
+    // 新基线一旦开始载入，旧基线与旧返工对照全部作废；
+    // 令牌立即推进，任何迟到的旧解码/对齐结果都不再可提交
+    const token = ++baseTokenRef.current;
+    reworkTokenRef.current++;
     setStatus('loading');
     setError(null);
     try {
       const next = await loadAndScanWav(file);
+      if (token !== baseTokenRef.current) {
+        // 载入期间又选了更新的文件：放弃本次结果，释放它独占的对象 URL
+        URL.revokeObjectURL(next.objectUrl);
+        return;
+      }
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
       objectUrlRef.current = next.objectUrl;
       setLoaded(next);
@@ -95,8 +151,11 @@ export default function App() {
       setComparison(null);
       setRuleInputs(DEFAULT_RULE_INPUTS);
       setRuleError(null);
+      // 新基线载入：返工对照必须清空（旧对照引用旧基线 PCM）
+      resetReworkState();
       setStatus('done');
     } catch (err) {
+      if (token !== baseTokenRef.current) return;
       if (err instanceof WavError) {
         setError({
           code: err.code,
@@ -115,8 +174,186 @@ export default function App() {
       // 解码失败：清空旧比较，避免残留基于其他文件的结论
       setComparison(null);
       setRuleError(null);
+      // 基线解码失败：无有效基线，返工对照一并清空
+      resetReworkState();
       setStatus('error');
     }
+  };
+
+  /**
+   * 清空全部返工对照状态并释放返工对象 URL。
+   * 新基线载入、基线解码失败或手动移除返工时调用。
+   */
+  const resetReworkState = () => {
+    reworkTokenRef.current++;
+    if (reworkObjectUrlRef.current) {
+      URL.revokeObjectURL(reworkObjectUrlRef.current);
+      reworkObjectUrlRef.current = null;
+    }
+    setReworkLoaded(null);
+    setReworkComparison(null);
+    setReworkError(null);
+    setAnchorError(null);
+    setAnchorInputs(DEFAULT_ANCHOR_INPUTS);
+    setReworkBusy(false);
+    setReworkStatus('idle');
+    setReworkPosition(0);
+  };
+
+  /**
+   * 载入返工文件：
+   * - 返工解码失败时【保留已确认的旧对照】，不清空 reworkComparison / reworkLoaded；
+   * - 载入成功即旧对照失效（PCM 已换），清空对照等待重新对齐；
+   * - 迟到的解码结果不能覆盖更新的选择（令牌校验）。
+   */
+  const handleReworkFile = async (file: File | null | undefined) => {
+    if (!file) return;
+    if (!loaded) return;
+    const token = ++reworkTokenRef.current;
+    setReworkStatus('loading');
+    setReworkError(null);
+    setReworkBusy(false);
+    try {
+      const next = await loadAndScanWav(file);
+      if (token !== reworkTokenRef.current) {
+        URL.revokeObjectURL(next.objectUrl);
+        return;
+      }
+      if (reworkObjectUrlRef.current) URL.revokeObjectURL(reworkObjectUrlRef.current);
+      reworkObjectUrlRef.current = next.objectUrl;
+      setReworkLoaded(next);
+      setReworkPosition(0);
+      // 新返工 PCM：旧对照的偏移与片段数组基于旧文件，必须清空
+      setReworkComparison(null);
+      setAnchorError(null);
+      setReworkStatus('done');
+    } catch (err) {
+      if (token !== reworkTokenRef.current) return;
+      // 解码失败：保留已确认的旧对照与旧返工文件，仅就地报错
+      const state: ErrorState =
+        err instanceof WavError
+          ? { code: err.code, title: ERROR_MESSAGES[err.code], detail: err.message }
+          : {
+              code: 'SCAN_FAILED',
+              title: ERROR_MESSAGES.DECODE_FAILED,
+              detail: `返工文件扫描过程中发生错误：${
+                err instanceof Error ? err.message : String(err)
+              }`
+            };
+      setReworkError(state);
+      setReworkStatus('error');
+    }
+  };
+
+  /**
+   * 应用锚点对齐并建立返工对照：
+   * - 输入非法 / 锚点静音或能量不足 / 采样率声道不一致：就地提示，保留上一次对照；
+   * - 对齐与切片为同步纯计算（在已解码 PCM 上），但仍以令牌守卫，
+   *   避免与快速换文件竞争；迟到结果不得覆盖较新文件。
+   */
+  const applyReworkAlignment = () => {
+    if (!loaded || !reworkLoaded) return;
+    const token = reworkTokenRef.current;
+    // 捕获当前已确认的两份扫描：setTimeout 回调执行时状态可能已切换，
+    // 令牌会拦截过期回调，未过期时这两个引用正是本次对齐对象
+    const baselineResult = loaded.result;
+    const reworkResult = reworkLoaded.result;
+    const anchor = parseAnchorInput(
+      anchorInputs,
+      baselineResult.sampleRate,
+      baselineResult.channels.length
+    );
+    if (anchor === null) {
+      setAnchorError(INVALID_ANCHOR_NOTICE);
+      return;
+    }
+    const baseData = baselineResult.channelData[anchor.channel];
+    const reworkData = reworkResult.channelData[anchor.channel];
+    if (!baseData || !reworkData) {
+      setAnchorError('对齐声道在已解码 PCM 中不存在，无法对齐');
+      return;
+    }
+    setReworkBusy(true);
+    // 让“正在对齐”状态先上屏；计算推迟一个任务，与将来的异步相关计算
+    // 走同一条令牌守卫路径（迟到结果不能覆盖较新文件）
+    setTimeout(() => {
+      if (token !== reworkTokenRef.current) return;
+      const aligned = alignByAnchor(baseData, reworkData, anchor);
+      if ('kind' in aligned) {
+        const err: AnchorError = aligned;
+        // 静音 / 能量不足 / 参数问题：不强行对齐，保留上一次已确认对照
+        setAnchorError(alignmentErrorMessage(err));
+        setReworkBusy(false);
+        return;
+      }
+      try {
+        const next = buildReworkComparison(
+          baselineResult,
+          reworkResult,
+          anchor,
+          aligned
+        );
+        setReworkComparison(next);
+        setAnchorError(null);
+      } catch (e) {
+        if (e instanceof ReworkMismatchError) {
+          setAnchorError(e.message);
+        } else {
+          setAnchorError(
+            `返工对照构建失败：${e instanceof Error ? e.message : String(e)}`
+          );
+        }
+      } finally {
+        setReworkBusy(false);
+      }
+    }, 0);
+  };
+
+  /** 返工对照定位试听：同一差异片段分别映射回原件 / 返工件时间轴 */
+  const seekReworkSide = (
+    seg: ReworkDiffSegment,
+    side: 'baseline' | 'rework'
+  ) => {
+    const seconds =
+      side === 'baseline' ? seg.baselineStartSeconds : seg.reworkStartSeconds;
+    if (seconds === null) return;
+    if (side === 'baseline') {
+      seekTo(seconds);
+      focusLocalView(seconds, windowSeconds);
+      return;
+    }
+    const audio = reworkAudioRef.current;
+    if (!audio || !reworkLoaded) return;
+    const clamped = Math.min(
+      reworkLoaded.result.durationSeconds,
+      Math.max(0, seconds)
+    );
+    audio.currentTime = clamped;
+    setReworkPosition(clamped);
+    void audio.play().catch(() => {
+      /* 浏览器拦截自动播放时保持定位即可 */
+    });
+  };
+
+  /** 差异表行：两侧播放器同步跳到该片段各自坐标；只一侧存在的片段跳存在侧 */
+  const locateReworkSegment = (seg: ReworkDiffSegment) => {
+    seekReworkSide(seg, 'baseline');
+    seekReworkSide(seg, 'rework');
+  };
+
+  /** 点击返工波形：仅定位返工播放器（返工自身时间轴） */
+  const seekReworkSeconds = (seconds: number) => {
+    const audio = reworkAudioRef.current;
+    if (!audio || !reworkLoaded) return;
+    const clamped = Math.min(
+      reworkLoaded.result.durationSeconds,
+      Math.max(0, seconds)
+    );
+    audio.currentTime = clamped;
+    setReworkPosition(clamped);
+    void audio.play().catch(() => {
+      /* 浏览器拦截自动播放时保持定位即可 */
+    });
   };
 
   const seekTo = (seconds: number) => {
@@ -474,6 +711,258 @@ export default function App() {
               </div>
             )}
           </section>
+
+          <section className="panel rework-panel" data-testid="rework-panel">
+            <h2 className="compare-title">返工文件对照（先对齐再裁决，不改动上方基线结论）</h2>
+            <p className="privacy-note" style={{ marginBottom: 12 }}>
+              选取原件中一段<strong>有效声音</strong>作锚点，在限定帧偏移内对两份已解码
+              PCM 做归一化互相关，按“最高相关度 → 最小绝对偏移 → 负偏移优先”确定唯一对齐。
+              静音或能量不足的锚点不会强行对齐；两份扫描只在真实重叠的原始帧范围内比较，
+              未覆盖区域标记为不可比较。文件全程不离开本机。
+            </p>
+            <div className="compare-controls">
+              <label htmlFor="rework-input">返工 WAV：</label>
+              <input
+                id="rework-input"
+                data-testid="rework-input"
+                type="file"
+                accept=".wav,audio/wav,audio/x-wav,audio/wave"
+                onChange={(e) => void handleReworkFile(e.target.files?.[0])}
+              />
+              {reworkStatus === 'loading' && (
+                <span className="loading" data-testid="rework-loading">
+                  正在本地解码返工文件…
+                </span>
+              )}
+              {reworkLoaded && (
+                <button
+                  onClick={resetReworkState}
+                  data-testid="clear-rework"
+                >
+                  移除返工文件
+                </button>
+              )}
+            </div>
+            {reworkStatus === 'error' && reworkError && (
+              <div className="view-error" data-testid="rework-error" style={{ marginTop: 8 }}>
+                [{reworkError.code}] {reworkError.title}：{reworkError.detail}
+                {reworkComparison && (
+                  <div style={{ color: 'var(--warn)', marginTop: 4 }}>
+                    已保留此前确认的对照结果，未被本次失败覆盖。
+                  </div>
+                )}
+              </div>
+            )}
+
+            {reworkLoaded && (
+              <>
+                <div className="rework-meta" data-testid="rework-meta">
+                  返工文件：{reworkLoaded.result.fileName} ·{' '}
+                  {reworkLoaded.result.sampleRate} Hz ·{' '}
+                  {reworkLoaded.result.channels.length} 声道 ·{' '}
+                  {formatSeconds(reworkLoaded.result.durationSeconds)} s ·{' '}
+                  {reworkLoaded.result.channels.reduce(
+                    (n, c) => n + c.segments.length,
+                    0
+                  )}{' '}
+                  段
+                </div>
+                <div className="compare-controls" style={{ marginTop: 10 }}>
+                  <label htmlFor="anchor-start">锚点起点（秒）：</label>
+                  <input
+                    id="anchor-start"
+                    data-testid="anchor-start"
+                    type="text"
+                    inputMode="decimal"
+                    value={anchorInputs.startSeconds}
+                    onChange={(e) => {
+                      setAnchorInputs({ ...anchorInputs, startSeconds: e.target.value });
+                      setAnchorError(null);
+                    }}
+                  />
+                  <label htmlFor="anchor-length">锚点长度（秒）：</label>
+                  <input
+                    id="anchor-length"
+                    data-testid="anchor-length"
+                    type="text"
+                    inputMode="decimal"
+                    value={anchorInputs.lengthSeconds}
+                    onChange={(e) => {
+                      setAnchorInputs({ ...anchorInputs, lengthSeconds: e.target.value });
+                      setAnchorError(null);
+                    }}
+                  />
+                  <label htmlFor="anchor-max-offset">限定帧偏移（±帧）：</label>
+                  <input
+                    id="anchor-max-offset"
+                    data-testid="anchor-max-offset"
+                    type="text"
+                    inputMode="numeric"
+                    value={anchorInputs.maxOffsetFrames}
+                    onChange={(e) => {
+                      setAnchorInputs({ ...anchorInputs, maxOffsetFrames: e.target.value });
+                      setAnchorError(null);
+                    }}
+                  />
+                  <label htmlFor="anchor-channel">对齐声道：</label>
+                  <input
+                    id="anchor-channel"
+                    data-testid="anchor-channel"
+                    type="text"
+                    inputMode="numeric"
+                    value={anchorInputs.channel}
+                    onChange={(e) => {
+                      setAnchorInputs({ ...anchorInputs, channel: e.target.value });
+                      setAnchorError(null);
+                    }}
+                  />
+                  <button
+                    className="primary"
+                    onClick={applyReworkAlignment}
+                    data-testid="apply-anchor"
+                    disabled={reworkBusy}
+                  >
+                    {reworkBusy ? '对齐计算中…' : '对齐并对照'}
+                  </button>
+                </div>
+                {anchorError && (
+                  <div className="view-error" data-testid="anchor-error" style={{ marginTop: 8 }}>
+                    {anchorError}
+                  </div>
+                )}
+
+                {reworkComparison && (
+                  <div className="compare-summary" data-testid="rework-summary">
+                    <div className="rework-alignment" data-testid="rework-alignment">
+                      唯一对齐偏移：
+                      <strong data-testid="rework-offset">
+                        {formatOffset(reworkComparison.alignment.offsetFrames)} 帧
+                      </strong>
+                      （返工帧 = 原件帧{' '}
+                      {reworkComparison.alignment.offsetFrames >= 0
+                        ? `+ ${reworkComparison.alignment.offsetFrames}`
+                        : `− ${Math.abs(reworkComparison.alignment.offsetFrames)}`}
+                      ）· 归一化相关度{' '}
+                      {reworkComparison.alignment.score.toFixed(4)} · 锚点 RMS{' '}
+                      {reworkComparison.alignment.anchorRms.toFixed(4)} ·{' '}
+                      {reworkComparison.alignment.comparedFrames} 帧参与相关
+                    </div>
+                    <div className="diff-summary" data-testid="rework-counts">
+                      {`已修复（仅原件）${reworkComparison.fixedCount} · 新引入（仅返工）${reworkComparison.introducedCount} · 仍削波（两边共有）${reworkComparison.remainingCount} · 不可比较 ${reworkComparison.uncomparedCount}`}
+                    </div>
+                    <audio
+                      ref={reworkAudioRef}
+                      controls
+                      src={reworkLoaded.objectUrl}
+                      data-testid="rework-audio-player"
+                      onTimeUpdate={(e) => setReworkPosition(e.currentTarget.currentTime)}
+                    />
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+
+          {reworkComparison && (
+            <section className="panel" data-testid="rework-dual-panel">
+              <h2 className="compare-title">双波形与差异片段（偏移与片段数组共用）</h2>
+              <div className="legend" style={{ marginBottom: 10 }}>
+                <span>
+                  <span
+                    className="swatch"
+                    style={{ background: REWORK_STRIPE_COLORS.BASELINE_ONLY }}
+                  />
+                  仅原件（返工已修复）
+                </span>
+                <span>
+                  <span
+                    className="swatch"
+                    style={{ background: REWORK_STRIPE_COLORS.REWORK_ONLY }}
+                  />
+                  仅返工件（新引入）
+                </span>
+                <span>
+                  <span
+                    className="swatch"
+                    style={{ background: REWORK_STRIPE_COLORS.BOTH }}
+                  />
+                  两边仍削波（未修复）
+                </span>
+                <span>
+                  <span
+                    className="swatch"
+                    style={{ background: REWORK_STRIPE_COLORS.BASELINE_UNCOMPARED }}
+                  />
+                  原件超出重叠（不可比较）
+                </span>
+                <span>
+                  <span
+                    className="swatch"
+                    style={{ background: REWORK_STRIPE_COLORS.REWORK_UNCOMPARED }}
+                  />
+                  返工超出重叠（不可比较）
+                </span>
+              </div>
+              {loaded.result.channels.map((bch) => {
+                const rch = reworkComparison!.rework.channels[bch.channel]!;
+                const channelDiffs = reworkComparison!.channels[bch.channel]!;
+                const stripes = channelDiffs.segments.map((seg) => ({
+                  ...seg,
+                  source: 'rework' as const
+                }));
+                return (
+                  <div
+                    className="rework-channel"
+                    key={`rework-${bch.channel}`}
+                    data-testid="rework-channel"
+                    data-channel={bch.channel}
+                  >
+                    <div className="channel-head">
+                      <h3>{channelLabel(bch.channel, loaded.result.channels.length)}</h3>
+                      <span className="channel-stat">
+                        重叠（原件帧）：
+                        {channelDiffs.overlapBaseline
+                          ? `${channelDiffs.overlapBaseline.startFrame}–${channelDiffs.overlapBaseline.endFrame}`
+                          : '无真实重叠'}
+                      </span>
+                    </div>
+                    <div className="rework-wave-row">
+                      <div className="rework-wave-col">
+                        <div className="rework-wave-label">原件（基线）</div>
+                        <Waveform
+                          data={loaded.result.channelData[bch.channel]!}
+                          sampleRate={loaded.result.sampleRate}
+                          segments={bch.segments}
+                          positionSeconds={position}
+                          viewRange={fullTrackRange(loaded.result.durationSeconds)}
+                          onSeek={(sec) => seekTo(sec)}
+                          stripes={stripes}
+                          stripeSide="baseline"
+                        />
+                      </div>
+                      <div className="rework-wave-col">
+                        <div className="rework-wave-label">返工件（已按偏移映射对着色）</div>
+                        <Waveform
+                          data={reworkComparison!.rework.channelData[bch.channel]!}
+                          sampleRate={reworkComparison!.rework.sampleRate}
+                          segments={rch.segments}
+                          positionSeconds={reworkPosition}
+                          viewRange={fullTrackRange(reworkComparison!.rework.durationSeconds)}
+                          onSeek={(sec) => seekReworkSeconds(sec)}
+                          stripes={stripes}
+                          stripeSide="rework"
+                        />
+                      </div>
+                    </div>
+                    <ReworkDiffList
+                      segments={channelDiffs.segments}
+                      onLocate={locateReworkSegment}
+                    />
+                  </div>
+                );
+              })}
+            </section>
+          )}
 
           {loaded.result.channels.map((ch) => (
             <section
