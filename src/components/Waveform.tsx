@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { ClipSegment } from '../audio/types';
 import type { DiffMembership, DiffSegment } from '../audio/compare';
+import type { ReworkDiffKind, WaveMark } from '../audio/rework';
 import type { ViewRange } from '../audio/view-range';
 
 /** 差异条着色：与差异表共用同一差异数组的标记 */
@@ -8,6 +9,18 @@ export const DIFF_STRIPE_COLORS: Record<DiffMembership, string> = {
   BASELINE_ONLY: '#ff7a45',
   CANDIDATE_ONLY: '#52c41a',
   BOTH: '#94a3b8'
+};
+
+/**
+ * 返工对照双波形着色：与返工差异表共用同一 ReworkDiffSegment 数组
+ * （经 baselineWaveMarks/reworkWaveMarks 按各自文件坐标映射）。
+ */
+export const REWORK_MARK_COLORS: Record<ReworkDiffKind, string> = {
+  FIXED: '#38d39f', // 已修复：绿
+  NEW: '#ff4d4f', // 返工新增：红
+  BOTH: '#94a3b8', // 两侧共有：灰
+  BASELINE_ONLY: '#6b7689', // 不可比较（返工未覆盖）：暗灰
+  REWORK_ONLY: '#6b7689' // 不可比较（基线未覆盖）：暗灰
 };
 
 interface WaveformProps {
@@ -20,6 +33,11 @@ interface WaveformProps {
   onSeek: (seconds: number) => void;
   /** 候选规则比较的差异片段（与差异表同一数组）；未启用比较时不传 */
   diffs?: DiffSegment[];
+  /**
+   * 返工对照着色标记（已映射到【当前这份文件】坐标，与差异表共用同一片段数组）；
+   * 未启用返工对照时不传，波形行为与单文件质检完全一致。
+   */
+  marks?: WaveMark[];
 }
 
 /**
@@ -37,7 +55,8 @@ export default function Waveform({
   positionSeconds,
   viewRange,
   onSeek,
-  diffs
+  diffs,
+  marks
 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -167,6 +186,22 @@ export default function Waveform({
         }
       }
 
+      // 返工对照着色：标记已是【当前文件】坐标，与差异表共用同一片段数组。
+      // 半透明竖带叠在波形上（原红色削波层保持不变，两者可同时可见）。
+      if (marks && marks.length > 0) {
+        for (const m of marks) {
+          const s = Math.max(m.startSeconds, startSec);
+          const e = Math.min(m.endSeconds, endSec);
+          if (e <= s) continue;
+          const x0 = xForTime(s);
+          const x1 = Math.max(x0 + 1, xForTime(e));
+          ctx.fillStyle = REWORK_MARK_COLORS[m.kind];
+          ctx.globalAlpha = 0.2;
+          ctx.fillRect(x0, 0, x1 - x0, cssHeight);
+          ctx.globalAlpha = 1;
+        }
+      }
+
       // 播放位置游标（仅当位置落在视窗内）
       if (positionSeconds >= startSec && positionSeconds <= endSec) {
         const px = Math.min(cssWidth - 1, Math.max(0, xForTime(positionSeconds)));
@@ -183,7 +218,7 @@ export default function Waveform({
     const observer = new ResizeObserver(draw);
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [data, sampleRate, segments, positionSeconds, startSec, span, duration, diffs]);
+  }, [data, sampleRate, segments, positionSeconds, startSec, span, duration, diffs, marks]);
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;

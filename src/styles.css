@@ -437,3 +437,99 @@ audio {
   color: #101725;
   background: #94a3b8;
 }
+
+/* ---------------- 返工文件对照 ---------------- */
+
+.rework-panel .compare-title {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.rework-panel input[type='file'] {
+  color: var(--muted);
+}
+
+.rework-meta {
+  margin: 12px 0 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rework-anchor-controls {
+  margin-top: 4px;
+}
+
+.rework-anchor-controls input[type='text'] {
+  width: 84px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rework-anchor-controls input[type='text']:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.rework-channels {
+  margin-top: 14px;
+}
+
+.rework-channel-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 14px;
+  background: var(--panel-2);
+}
+
+.rework-channel-block h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.rework-wave-row {
+  display: flex;
+  gap: 12px;
+}
+
+.rework-wave-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.rework-wave-caption {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.rework-legend {
+  margin-top: 10px;
+}
+
+.diff-badge.rework-fixed {
+  color: #062206;
+  background: #38d39f;
+}
+
+.diff-badge.rework-new {
+  color: #2a0606;
+  background: #ff4d4f;
+}
+
+.diff-badge.rework-both {
+  color: #101725;
+  background: #94a3b8;
+}
+
+.diff-badge.rework-incomparable {
+  color: #c6d0e0;
+  background: #6b7689;
+}
