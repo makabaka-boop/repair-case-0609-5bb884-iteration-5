@@ -1,0 +1,40 @@
+services:
+  # 核验台 web：纯静态站点，文件仅在浏览器本地处理
+  web:
+    build:
+      context: .
+      target: runtime
+    image: wav-clip-inspection-bench
+    ports:
+      # 宿主端口可由 WEB_PORT 覆盖，默认 8080
+      - "${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # 一次性验收服务：Vitest 单测 + Playwright 端到端，全部通过退出码 0
+  verify:
+    build:
+      context: .
+      target: runtime
+    image: wav-clip-inspection-bench
+    depends_on:
+      web:
+        condition: service_started
+    environment:
+      # 直接对 web 服务做端到端验收，不重复拉起本地预览服务器
+      PLAYWRIGHT_BASE_URL: http://web:8080
+      WAIT_URL: http://web:8080/
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "==> 等待 web 服务就绪"
+        node scripts/wait-for-web.cjs
+        echo "==> [1/2] Vitest 单元测试（覆盖率阈值 95%）"
+        npx vitest run --coverage
+        echo "==> [2/2] Playwright 端到端验收（载入/定位/结论/失败提示）"
+        npx playwright test
+        echo "==> 验收全部通过"
+    profiles:
+      - verify
+    restart: "no"
